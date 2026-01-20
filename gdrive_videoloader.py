@@ -123,6 +123,9 @@ def retry_with_backoff(
         try:
             result = func()
             return result, None
+        except DownloadInterrupted:
+            # Don't retry on user interrupt, re-raise immediately
+            raise
         except Exception as e:
             last_exception = e
 
@@ -155,11 +158,17 @@ def retry_with_backoff(
 # Global flag for graceful interruption
 _interrupted = False
 
+
+class DownloadInterrupted(Exception):
+    """Raised when download is interrupted by user."""
+    pass
+
+
 def _signal_handler(signum, frame):
     """Handle SIGINT/SIGTERM for graceful shutdown."""
     global _interrupted
     _interrupted = True
-    print("\n[INTERRUPT] Caught signal, finishing current video and saving state...")
+    print("\n[INTERRUPT] Aborting download, will resume from this video on next run...")
 
 
 def list_folder_contents(folder_id: str, api_key: str, resource_key: str = None, verbose: bool = False) -> list[dict]:
@@ -266,6 +275,7 @@ def get_video_url(page_content: str, verbose: bool) -> tuple[str, str]:
 
 def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbose: bool) -> None:
     """Downloads the file from the given URL with provided cookies, supports resuming."""
+    global _interrupted
     headers = {}
     file_mode = 'wb'
 
@@ -286,6 +296,9 @@ def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbo
         with open(filename, file_mode) as file:
             with tqdm(total=total_size, initial=downloaded_size, unit='B', unit_scale=True, desc=filename, file=sys.stdout) as pbar:
                 for chunk in response.iter_content(chunk_size=chunk_size):
+                    if _interrupted:
+                        response.close()
+                        raise DownloadInterrupted("Download interrupted by user")
                     if chunk:
                         file.write(chunk)
                         pbar.update(len(chunk))
@@ -297,6 +310,7 @@ def download_file(url: str, cookies: dict, filename: str, chunk_size: int, verbo
 def download_chunk(url: str, cookies: dict, start: int, end: int, chunk_id: int,
                    filename: str, chunk_size: int, pbar: tqdm, lock: threading.Lock) -> bool:
     """Downloads a specific byte range of the file."""
+    global _interrupted
     headers = {'Range': f'bytes={start}-{end}'}
     try:
         response = requests.get(url, stream=True, cookies=cookies, headers=headers)
@@ -306,11 +320,16 @@ def download_chunk(url: str, cookies: dict, start: int, end: int, chunk_id: int,
         with open(filename, 'r+b') as f:
             f.seek(start)
             for chunk in response.iter_content(chunk_size=chunk_size):
+                if _interrupted:
+                    response.close()
+                    raise DownloadInterrupted("Download interrupted by user")
                 if chunk:
                     f.write(chunk)
                     with lock:
                         pbar.update(len(chunk))
         return True
+    except DownloadInterrupted:
+        raise
     except Exception as e:
         return False
 
@@ -365,6 +384,7 @@ def download_file_parallel(url: str, cookies: dict, filename: str, chunk_size: i
 
     # Download chunks in parallel
     success = True
+    interrupted = False
     with ThreadPoolExecutor(max_workers=num_connections) as executor:
         futures = {
             executor.submit(download_chunk, url, cookies, start, end, chunk_id,
@@ -378,11 +398,20 @@ def download_file_parallel(url: str, cookies: dict, filename: str, chunk_size: i
                 if not future.result():
                     print(f"\nChunk {chunk_id} failed to download")
                     success = False
+            except DownloadInterrupted:
+                interrupted = True
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
+                break
             except Exception as e:
                 print(f"\nChunk {chunk_id} error: {e}")
                 success = False
 
     pbar.close()
+
+    if interrupted:
+        raise DownloadInterrupted("Download interrupted by user")
 
     if success:
         print(f"\n{filename} downloaded successfully.")
@@ -462,6 +491,9 @@ def download_single_video(video_id: str, output_file: str, chunk_size: int, verb
             print(f"Unable to retrieve the video URL for {video_id}.")
             return result
 
+    except DownloadInterrupted:
+        # Re-raise immediately, don't treat as error
+        raise
     except requests.exceptions.ConnectionError as e:
         result['error_type'] = 'network'
         result['error_message'] = str(e)
@@ -530,6 +562,9 @@ def download_folder(folder_url: str, api_key: str, output_dir: str, chunk_size: 
                 success_count += 1
             else:
                 fail_count += 1
+        except DownloadInterrupted:
+            print("\n[INTERRUPT] Download aborted")
+            break
         except Exception:
             fail_count += 1
         print()
@@ -693,6 +728,14 @@ def download_from_url_list(
                     fail_count += 1
                     print(f"[FAIL] {result.get('error_message', 'Unknown error')}")
 
+            except DownloadInterrupted:
+                # Mark as pending so it will resume on next run
+                video_state['status'] = 'pending'
+                video_state['attempts'] = max(0, video_state.get('attempts', 1) - 1)  # Don't count interrupted attempt
+                save_state(state_file, state)
+                print("[INTERRUPT] Download interrupted, will resume on next run")
+                break
+
             except Exception as e:
                 video_state['status'] = 'failed'
                 video_state['error'] = str(e)
@@ -708,11 +751,6 @@ def download_from_url_list(
         # Restore signal handlers
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
-
-        # If interrupted while processing a video, mark it as pending (not failed)
-        if _interrupted and current_video_id and current_video_id in state['videos']:
-            state['videos'][current_video_id]['status'] = 'pending'
-            save_state(state_file, state)
 
         # Reset interrupted flag
         _interrupted = False
@@ -792,6 +830,9 @@ def main(urls: list[str], output: str = None, chunk_size: int = 1024, verbose: b
                     else:
                         print("Ensure the video ID is correct and accessible.")
                         fail_count += 1
+                except DownloadInterrupted:
+                    print("\n[INTERRUPT] Download aborted")
+                    break
                 except Exception:
                     print("Ensure the video ID is correct and accessible.")
                     fail_count += 1
@@ -801,6 +842,8 @@ def main(urls: list[str], output: str = None, chunk_size: int = 1024, verbose: b
                     result = download_single_video(video_id, output, chunk_size, verbose, num_connections)
                     if not result['success']:
                         print("Ensure the video ID is correct and accessible.")
+                except DownloadInterrupted:
+                    print("\n[INTERRUPT] Download aborted")
                 except Exception:
                     print("Ensure the video ID is correct and accessible.")
 
